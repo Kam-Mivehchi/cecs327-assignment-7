@@ -1,4 +1,5 @@
 import socket
+
 # Create a TCP/IP socket
 myTCPSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 while True:
