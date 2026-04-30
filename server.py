@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 DATABASE_URL = os.environ["DATABASE_URL"]
-
+PORT = int(os.environ["PORT"])
 
 
 try:
@@ -18,9 +18,9 @@ except Exception as e:
 
 
 myTCPSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-myTCPSocket.bind(('0.0.0.0', 1024))
+myTCPSocket.bind(('0.0.0.0', PORT))
 myTCPSocket.listen(5)
-print("Server is ready to receive on port " + str(1024))
+print("Server is ready to receive on port " + str(PORT))
 
 
 incomingSOCKET, incomingAddress = myTCPSocket.accept()
@@ -30,7 +30,7 @@ print("Connection from: " + str(incomingAddress))
 while True:
     try:
 
-        myData = incomingSOCKET.recv(1024).decode("utf-8")
+        myData = incomingSOCKET.recv(PORT).decode("utf-8")
 
 
         if not myData:
