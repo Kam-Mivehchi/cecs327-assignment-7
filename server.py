@@ -1,13 +1,35 @@
 import psycopg2
 import socket
-import os 
+import os
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
+
 load_dotenv()
-DATABASE_URL = os.environ["DATABASE_URL"]
-PORT = int(os.environ["PORT"])
+# Config from environment variables
+DATABASE_URL        = os.environ["DATABASE_URL"]
+REMOTE_DATABASE_URL = os.environ.get("REMOTE_DATABASE_URL")
+PORT                = int(os.environ["PORT"])
+ 
+HOUSE_A_TOPIC = os.environ.get("HOUSE_A_TOPIC", "")
+HOUSE_B_TOPIC = os.environ.get("HOUSE_B_TOPIC", "")
+
+# Per-DB table names — partner uses different naming convention
+LOCAL_VIRTUAL_TABLE  = 'public."table1_virtual"'
+REMOTE_VIRTUAL_TABLE = 'public."Table 1_virtual"'
+ 
+PST = timezone(timedelta(hours=-8))
+SHARING_START_MS = int(datetime.strptime(
+    os.environ.get("SHARING_START", "2026-04-28 00:00:00"),
+    "%Y-%m-%d %H:%M:%S"
+).replace(tzinfo=PST).timestamp() * 1000)
+ 
+
+# Conversion factors
+LITERS_TO_GALLONS = 0.264172
 
 
+# Connect to the databases
 try:
     conn = psycopg2.connect(DATABASE_URL)
     cursor = conn.cursor()
@@ -16,8 +38,129 @@ except Exception as e:
     print("Failed to connect to the database: " + str(e))
     exit()
 
+remote_conn = None
+remote_cursor = None
+if REMOTE_DATABASE_URL:
+    try:
+        remote_conn = psycopg2.connect(REMOTE_DATABASE_URL)
+        remote_cursor = remote_conn.cursor()
+        print("Connected to remote DB.")    
+    except Exception as e:
+        print("Remote DB unavailable: " + str(e))
 
+
+
+
+
+
+
+# Data Aggregation Logic
+
+
+# SUM + COUNT for one sensor on one device type for one house in a time window. 
+def aggregate(curs, table_name, payload_key, board_keyword, house_topic, t_start, t_end):
+    if curs is None:
+        return 0.0, 0
+    sql = f"""
+        SELECT SUM((payload->>'{payload_key}')::numeric) AS total,
+               COUNT(*) AS n
+        FROM {table_name}
+        WHERE LOWER(payload->>'topic')      LIKE '%{house_topic.lower()}%'
+          AND LOWER(payload->>'board_name') LIKE '%{board_keyword.lower()}%'
+          AND (payload->>'timestamp')::bigint * 1000 BETWEEN {t_start} AND {t_end}
+          AND (payload->>'{payload_key}') IS NOT NULL
+    """
+    try:
+        curs.execute(sql)
+        row = curs.fetchone()
+        total = float(row[0]) if row and row[0] is not None else 0.0
+        n     = int(row[1])   if row else 0
+        return total, n
+    except Exception as e:
+        print("query error:", e)
+        try: curs.connection.rollback()
+        except Exception: pass
+        return 0.0, 0
+
+ 
+# Local-only for House A. For House B, split window at SHARING_START_MS if needed.
+def get_house(payload_key, board_keyword, house_topic, is_partner, t_start, t_end):
+    if not is_partner or t_start >= SHARING_START_MS:
+        total, n = aggregate(cursor, LOCAL_VIRTUAL_TABLE,
+                             payload_key, board_keyword,
+                             house_topic, t_start, t_end)
+        return total, n, "fully covered by local DB"
+ 
+    pre_t,  pre_n  = aggregate(remote_cursor, REMOTE_VIRTUAL_TABLE,
+                               payload_key, board_keyword, house_topic,
+                               t_start, SHARING_START_MS - 1)
+    post_t, post_n = aggregate(cursor, LOCAL_VIRTUAL_TABLE,
+                               payload_key, board_keyword, house_topic,
+                               SHARING_START_MS, t_end)
+    return pre_t + post_t, pre_n + post_n, "merged remote (pre-sharing) + local (post-sharing)"
+ 
+ 
+# Run aggregate for both houses over the past `hours`, format the section.
+def run_window(payload_key, board_keyword, hours, unit_label, convert):
+    t_end   = now_ms()
+    t_start = t_end - hours * 3600 * 1000
+ 
+    a_t, a_n, a_note = get_house(payload_key, board_keyword, HOUSE_A_TOPIC,
+                                 is_partner=False, t_start=t_start, t_end=t_end)
+    b_t, b_n, b_note = get_house(payload_key, board_keyword, HOUSE_B_TOPIC,
+                                 is_partner=True,  t_start=t_start, t_end=t_end)
+ 
+    total_n = a_n + b_n
+    a_avg = convert(a_t / a_n) if a_n else 0
+    b_avg = convert(b_t / b_n) if b_n else 0
+    combined = convert((a_t + b_t) / total_n) if total_n else 0
+ 
+    return (
+        f"  Window: {to_pst(t_start)} -> {to_pst(t_end)}\n"
+        f"    House A:  {a_avg:.2f} {unit_label} ({a_n} readings) [{a_note}]\n"
+        f"    House B:  {b_avg:.2f} {unit_label} ({b_n} readings) [{b_note}]\n"
+        f"    Combined: {combined:.2f} {unit_label} ({total_n} readings)"
+    )
+
+
+
+# Query Handler
+
+# Q1: Average kitchen-fridge moisture - past 3 hours / week / month.
+def query_fridge_moisture():
+    payload_key   = "Moisture Meter - Smart Fridge Moisture Meter"
+    board_keyword = "fridge"
+    no_convert    = lambda x: x
+ 
+    sections = [
+        "Average fridge moisture",
+        "",
+        "[Past 3 hours]",
+        run_window(payload_key, board_keyword, 3,         "%RH", no_convert),
+        "",
+        "[Past week]",
+        run_window(payload_key, board_keyword, 24 * 7,    "%RH", no_convert),
+        "",
+        "[Past month]",
+        run_window(payload_key, board_keyword, 24 * 30,   "%RH", no_convert),
+    ]
+    return "\n".join(sections)
+ 
+
+
+# Utility functions
+def now_ms():
+    return int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+ 
+def to_pst(ms):
+    return datetime.fromtimestamp(ms / 1000, tz=PST).strftime("%Y-%m-%d %H:%M:%S PST")
+
+
+
+
+# Set up TCP server
 myTCPSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+myTCPSocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 myTCPSocket.bind(('0.0.0.0', PORT))
 myTCPSocket.listen(5)
 print("Server is ready to receive on port " + str(PORT))
@@ -43,9 +186,8 @@ while True:
         # Fridge Moisture
         if myData == "1":
 
-            cursor.execute('SELECT * FROM "Table 1_virtual" LIMIT 5')
-            rows = cursor.fetchall()
-            responseMessage = "Fridge Moisture Data: " + str(rows)
+         
+            responseMessage = query_fridge_moisture()
 
         # Dishwasher Water 
         elif myData == "2":
