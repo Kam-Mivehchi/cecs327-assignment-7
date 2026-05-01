@@ -83,19 +83,19 @@ if REMOTE_DATABASE_URL:
 
 # Data Aggregation Logic
 
+# Build SQL like: ((field) ILIKE '%v1%' OR (field) ILIKE '%v2%')
 def or_clause(field_extract, values):
-    """Build SQL like: ((field) ILIKE '%v1%' OR (field) ILIKE '%v2%')"""
     if not values:
         return "FALSE"
     return "(" + " OR ".join(f"({field_extract}) ILIKE '%{v}%'" for v in values) + ")"
  
+# SUM across all candidate payload keys per row (typically only one is non-null).
 def sum_keys_clause(payload_keys):
-    """SUM across all candidate payload keys per row (typically only one is non-null)."""
     parts = [f"COALESCE((payload->>'{k}')::numeric, 0)" for k in payload_keys]
     return " + ".join(parts) if parts else "0"
  
+# TRUE if a row has at least one non-null candidate key.
 def has_any_key_clause(payload_keys):
-    """TRUE if a row has at least one non-null candidate key."""
     parts = [f"(payload->>'{k}') IS NOT NULL" for k in payload_keys]
     return "(" + " OR ".join(parts) + ")" if parts else "FALSE"
 
