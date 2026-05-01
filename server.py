@@ -81,6 +81,7 @@ if REMOTE_DATABASE_URL:
 
 
 
+# Query Construction Logic
 
 # Build SQL like: ((field) ILIKE '%v1%' OR (field) ILIKE '%v2%')
 def or_clause(field_extract, values):
