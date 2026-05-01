@@ -28,6 +28,33 @@ SHARING_START_MS = int(datetime.strptime(
 # Conversion factors
 LITERS_TO_GALLONS = 0.264172
 
+# Device definitions: how to identify each device type and the relevant sensor keys for each.
+DEVICE_TYPES = {
+    "fridge": {
+        "board_keywords": ["fridge"],
+        "moisture_keys": [
+            "Moisture Meter - Smart Fridge Moisture Meter",   # House A canonical
+            "Moisture Meter - Moist1",                         # House B canonical
+        ],
+    },
+    "dishwasher": {
+        "board_keywords": ["dishwasher"],
+        "water_keys": [
+            "Water consumption sensor",   # House A
+            "Water Consumption Sensor",   # House B (case folded by SQL)
+        ],
+    },
+    # Electricity = sum of any ammeter reading on every device, per house.
+    "electricity": {
+        "board_keywords": ["fridge", "dishwasher"],
+        "ammeter_keys": [
+            "Ammeter",
+            "Ammetor",                   # the typo on House A fridge
+            "Ammeter dishwasher",
+        ],
+    },
+}
+
 
 # Connect to the databases
 try:
@@ -56,19 +83,36 @@ if REMOTE_DATABASE_URL:
 
 # Data Aggregation Logic
 
+def or_clause(field_extract, values):
+    """Build SQL like: ((field) ILIKE '%v1%' OR (field) ILIKE '%v2%')"""
+    if not values:
+        return "FALSE"
+    return "(" + " OR ".join(f"({field_extract}) ILIKE '%{v}%'" for v in values) + ")"
+ 
+def sum_keys_clause(payload_keys):
+    """SUM across all candidate payload keys per row (typically only one is non-null)."""
+    parts = [f"COALESCE((payload->>'{k}')::numeric, 0)" for k in payload_keys]
+    return " + ".join(parts) if parts else "0"
+ 
+def has_any_key_clause(payload_keys):
+    """TRUE if a row has at least one non-null candidate key."""
+    parts = [f"(payload->>'{k}') IS NOT NULL" for k in payload_keys]
+    return "(" + " OR ".join(parts) + ")" if parts else "FALSE"
 
 # SUM + COUNT for one sensor on one device type for one house in a time window. 
-def aggregate(curs, table_name, payload_key, board_keyword, house_topic, t_start, t_end):
+# we rely on the fact that for each device type, the relevant sensor keys are mutually exclusive across the two houses (e.g. "Moisture Meter - Smart Fridge Moisture Meter" only appears in House A, while "Moisture Meter - Moist1" only appears in House B). This allows us to write a single SQL query per house that sums across all candidate keys for that device type, without double-counting any readings.
+def aggregate(curs, table_name, board_keywords, payload_keys,
+              house_topic, t_start, t_end):
     if curs is None:
         return 0.0, 0
     sql = f"""
-        SELECT SUM((payload->>'{payload_key}')::numeric) AS total,
+        SELECT SUM({sum_keys_clause(payload_keys)}) AS total,
                COUNT(*) AS n
         FROM {table_name}
-        WHERE LOWER(payload->>'topic')      LIKE '%{house_topic.lower()}%'
-          AND LOWER(payload->>'board_name') LIKE '%{board_keyword.lower()}%'
+        WHERE LOWER(payload->>'topic') LIKE '%{house_topic.lower()}%'
+          AND {or_clause("payload->>'board_name'", board_keywords)}
           AND (payload->>'timestamp')::bigint * 1000 BETWEEN {t_start} AND {t_end}
-          AND (payload->>'{payload_key}') IS NOT NULL
+          AND {has_any_key_clause(payload_keys)}
     """
     try:
         curs.execute(sql)
@@ -84,30 +128,31 @@ def aggregate(curs, table_name, payload_key, board_keyword, house_topic, t_start
 
  
 # Local-only for House A. For House B, split window at SHARING_START_MS if needed.
-def get_house(payload_key, board_keyword, house_topic, is_partner, t_start, t_end):
+def get_house(board_keywords, payload_keys, house_topic,
+              is_partner, t_start, t_end):
     if not is_partner or t_start >= SHARING_START_MS:
         total, n = aggregate(cursor, LOCAL_VIRTUAL_TABLE,
-                             payload_key, board_keyword,
+                             board_keywords, payload_keys,
                              house_topic, t_start, t_end)
         return total, n, "fully covered by local DB"
  
     pre_t,  pre_n  = aggregate(remote_cursor, REMOTE_VIRTUAL_TABLE,
-                               payload_key, board_keyword, house_topic,
+                               board_keywords, payload_keys, house_topic,
                                t_start, SHARING_START_MS - 1)
     post_t, post_n = aggregate(cursor, LOCAL_VIRTUAL_TABLE,
-                               payload_key, board_keyword, house_topic,
+                               board_keywords, payload_keys, house_topic,
                                SHARING_START_MS, t_end)
     return pre_t + post_t, pre_n + post_n, "merged remote (pre-sharing) + local (post-sharing)"
  
  
 # Run aggregate for both houses over the past `hours`, format the section.
-def run_window(payload_key, board_keyword, hours, unit_label, convert):
+def run_window(board_keywords, payload_keys, hours, unit_label, convert):
     t_end   = now_ms()
     t_start = t_end - hours * 3600 * 1000
  
-    a_t, a_n, a_note = get_house(payload_key, board_keyword, HOUSE_A_TOPIC,
+    a_t, a_n, a_note = get_house(board_keywords, payload_keys, HOUSE_A_TOPIC,
                                  is_partner=False, t_start=t_start, t_end=t_end)
-    b_t, b_n, b_note = get_house(payload_key, board_keyword, HOUSE_B_TOPIC,
+    b_t, b_n, b_note = get_house(board_keywords, payload_keys, HOUSE_B_TOPIC,
                                  is_partner=True,  t_start=t_start, t_end=t_end)
  
     total_n = a_n + b_n
@@ -124,25 +169,25 @@ def run_window(payload_key, board_keyword, hours, unit_label, convert):
 
 
 
+
 # Query Handler
 
 # Q1: Average kitchen-fridge moisture - past 3 hours / week / month.
 def query_fridge_moisture():
-    payload_key   = "Moisture Meter - Smart Fridge Moisture Meter"
-    board_keyword = "fridge"
+    fridge = DEVICE_TYPES["fridge"] 
     no_convert    = lambda x: x
  
     sections = [
         "Average fridge moisture",
         "",
         "[Past 3 hours]",
-        run_window(payload_key, board_keyword, 3,         "%RH", no_convert),
+        run_window(fridge["board_keywords"], fridge["moisture_keys"], 3,     "%RH", no_convert),
         "",
         "[Past week]",
-        run_window(payload_key, board_keyword, 24 * 7,    "%RH", no_convert),
+        run_window(fridge["board_keywords"], fridge["moisture_keys"], 24*7,  "%RH", no_convert),
         "",
         "[Past month]",
-        run_window(payload_key, board_keyword, 24 * 30,   "%RH", no_convert),
+        run_window(fridge["board_keywords"], fridge["moisture_keys"], 24*30, "%RH", no_convert),
     ]
     return "\n".join(sections)
  
