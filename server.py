@@ -191,6 +191,25 @@ def query_fridge_moisture():
     ]
     return "\n".join(sections)
  
+# Q1: Average kitchen-fridge moisture - past 3 hours / week / month.
+def query_dishwasher_moisture():
+    dishwasher = DEVICE_TYPES["dishwasher"] 
+    no_convert    = lambda x: x
+ 
+    sections = [
+        "Average dishwasher water consumption",
+        "",
+        "[Past 3 hours]",
+        run_window(dishwasher["board_keywords"], dishwasher["water_keys"], 3,     "L", no_convert),
+        "",
+        "[Past week]",
+        run_window(dishwasher["board_keywords"], dishwasher["water_keys"], 24*7,  "L", no_convert),
+        "",
+        "[Past month]",
+        run_window(dishwasher["board_keywords"], dishwasher["water_keys"], 24*30, "L", no_convert),
+    ]
+    return "\n".join(sections)
+ 
 
 
 # Utility functions
@@ -237,9 +256,8 @@ while True:
         # Dishwasher Water 
         elif myData == "2":
 
-            cursor.execute('SELECT * FROM "Table 1_virtual" LIMIT 5')
-            rows = cursor.fetchall()
-            responseMessage = "Dishwasher Water Data: " + str(rows)
+
+            responseMessage = query_dishwasher_moisture()
 
         # House Electricity 
         elif myData == "3":
