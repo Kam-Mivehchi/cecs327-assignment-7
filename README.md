@@ -32,6 +32,7 @@ much?**
 * **How query completeness was determined:**
     * We determined completeness by making sure all the data is taken into consideration from before data sharing began and from after as well.
 * **How DataNiz metadata and data sharing were used:**
+    * We use the DataNiz metadata to distinguish between different appliances (IoT devices) within each house. In our SQL queries we filter on the board_name and topic in order to get the sum and count of each device’s sensor data for each house. We also utilize the timestamp data to both filter on specific date ranges and to signal a lookup in the remote database.
     * We used data sharing to fill in gaps that the other db may not possess to make a throrough and complete calculation.
 
 ## Instructions to Run
