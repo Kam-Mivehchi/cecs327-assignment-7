@@ -81,7 +81,6 @@ if REMOTE_DATABASE_URL:
 
 
 
-# Data Aggregation Logic
 
 # Build SQL like: ((field) ILIKE '%v1%' OR (field) ILIKE '%v2%')
 def or_clause(field_extract, values):
@@ -99,6 +98,7 @@ def has_any_key_clause(payload_keys):
     parts = [f"(payload->>'{k}') IS NOT NULL" for k in payload_keys]
     return "(" + " OR ".join(parts) + ")" if parts else "FALSE"
 
+# Data Aggregation Logic
 # SUM + COUNT for one sensor on one device type for one house in a time window. 
 # we rely on the fact that for each device type, the relevant sensor keys are mutually exclusive across the two houses (e.g. "Moisture Meter - Smart Fridge Moisture Meter" only appears in House A, while "Moisture Meter - Moist1" only appears in House B). This allows us to write a single SQL query per house that sums across all candidate keys for that device type, without double-counting any readings.
 def aggregate(curs, table_name, board_keywords, payload_keys,
@@ -209,7 +209,33 @@ def query_dishwasher_moisture():
         run_window(dishwasher["board_keywords"], dishwasher["water_keys"], 24*30, "L", no_convert),
     ]
     return "\n".join(sections)
- 
+
+
+def query_house_electricity():
+    el = DEVICE_TYPES["electricity"]
+    t_end   = now_ms()
+    t_start = t_end - 24 * 3600 * 1000
+
+    a_t, a_n, a_note = get_house(el["board_keywords"], el["ammeter_keys"],
+                                 HOUSE_A_TOPIC, is_partner=False,
+                                 t_start=t_start, t_end=t_end)
+    b_t, b_n, b_note = get_house(el["board_keywords"], el["ammeter_keys"],
+                                 HOUSE_B_TOPIC, is_partner=True,
+                                 t_start=t_start, t_end=t_end)
+
+    if a_n == 0 and b_n == 0:
+        return "No electricity data for either house in the past 24h."
+
+    diff   = abs(a_t - b_t)
+    winner = "House A" if a_t >= b_t else "House B"
+    loser  = "House B" if winner == "House A" else "House A"
+    pct    = (diff / max(a_t, b_t) * 100) if max(a_t, b_t) > 0 else 0
+    return (
+        f"Electricity past 24h ({to_pst(t_start)} to {to_pst(t_end)}):\n"
+        f"  House A: {a_t:.2f} kWh ({a_n} readings) [{a_note}]\n"
+        f"  House B: {b_t:.2f} kWh ({b_n} readings) [{b_note}]\n"
+        f"  {winner} used {diff:.2f} kWh more than {loser} ({pct:.1f}%)."
+    ) 
 
 
 # Utility functions
@@ -262,9 +288,7 @@ while True:
         # House Electricity 
         elif myData == "3":
 
-            cursor.execute('SELECT * FROM "Table 1_virtual" LIMIT 5')
-            rows = cursor.fetchall()
-            responseMessage = "Electricity Consumption Data: " + str(rows)
+            responseMessage = query_house_electricity()
 
 
         else:
